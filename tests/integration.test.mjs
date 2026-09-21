@@ -1,0 +1,35 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createHmac} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
+import vm from 'node:vm';
+import {createServer} from '../server.mjs';
+import validation from '../lead-validation.cjs';
+const secret='a'.repeat(64),url='https://script.google.com/macros/s/testdeployment/exec';
+const lead={submission_id:'test-integration-123456',nome:'Teste Integração',email:'teste@example.com',whatsapp:'+55 11 99999-0000',segmento:'tecnologia-saas',cargo:'socio-empresario',receita:'50k-100k',instagram:'@teste',page:'https://example.com/?email=private'};
+test('validação normaliza contato e remove parâmetros da página',()=>{const d=validation.validateLead_(lead);assert.equal(d.whatsapp,'5511999990000');assert.equal(d.instagram,'teste');assert.equal(d.page,'https://example.com/');});
+test('rejeita campos obrigatórios, honeypot e opções desconhecidas',()=>{for(const change of [{email:'inválido'},{website:'spam'},{segmento:'__proto__'},{instagram:''},{whatsapp:'123'},{submission_id:'curto'}])assert.throws(()=>validation.validateLead_({...lead,...change}));});
+test('entradas nunca se tornam fórmulas de planilha',()=>{for(const value of ['=IMPORTXML("x")','+SUM(1,2)','-1','@perfil'])assert.equal(validation.sheetText_(value),"'"+value);assert.equal(validation.sheetText_('João'),'João');});
+async function withServer(config,transport,fn){const server=createServer(config,transport);await new Promise(r=>server.listen(0,'127.0.0.1',r));const base=`http://127.0.0.1:${server.address().port}`;try{await fn(base);}finally{await new Promise(r=>server.close(r));}}
+const post=(base,data=lead)=>fetch(base+'/api/lead',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+test('sem configuração responde 503, nunca confirma cadastro',()=>withServer({},undefined,async base=>{const r=await post(base);assert.equal(r.status,503);assert.equal((await r.json()).ok,false);}));
+test('assinatura cobre os dados e resposta exige confirmação do Google',()=>withServer({GOOGLE_SCRIPT_URL:url,INTEGRATION_SECRET:secret},async(_url,opts)=>{const e=JSON.parse(opts.body);assert.equal(e.signature,createHmac('sha256',secret).update(e.timestamp+'.'+e.payload).digest('hex'));return Response.json({ok:true,id:lead.submission_id});},async base=>{const r=await post(base);assert.equal(r.status,200);assert.deepEqual(await r.json(),{ok:true,id:lead.submission_id});assert.equal((await fetch(base+'/.env')).status,404);assert.equal((await fetch(base+'/server.mjs')).status,404);}));
+test('falha do Google não gera falso sucesso',()=>withServer({GOOGLE_SCRIPT_URL:url,INTEGRATION_SECRET:secret},async()=>Response.json({ok:false,error:'save_failed'}),async base=>assert.equal((await post(base)).status,502)));
+test('erro de rede preserva resposta de erro recuperável',()=>withServer({GOOGLE_SCRIPT_URL:url,INTEGRATION_SECRET:secret},async()=>{throw Error('offline');},async base=>assert.equal((await post(base)).status,502)));
+test('bloqueia outra origem e limita tamanho e tipo da requisição',()=>withServer({GOOGLE_SCRIPT_URL:url,INTEGRATION_SECRET:secret,PUBLIC_ORIGIN:'https://example.com'},async()=>{throw Error('não deve enviar');},async base=>{assert.equal((await fetch(base+'/api/lead',{method:'POST',headers:{Origin:'https://other.example','Content-Type':'application/json'},body:JSON.stringify(lead)})).status,403);assert.equal((await fetch(base+'/api/lead',{method:'POST',body:'x'})).status,415);assert.equal((await post(base,{...lead,nome:'x'.repeat(20000)})).status,413);}));
+test('Apps Script autentica, grava uma vez e mantém dados do atendimento',async()=>{
+ const headers=['ID','Recebido em','Nome','WhatsApp','E-mail','Status','Responsável','Próximo contato','Observações','Segmento','Perfil','Faturamento mensal','Instagram','Origem','Campanha','Meio','Conteúdo','Termo','Página','Tipo','Atualizado em'];
+ const rows=[headers];let locked=false;
+ const range=(r,c,n=1,m=1)=>({getValues:()=>Array.from({length:n},(_,i)=>Array.from({length:m},(_,j)=>rows[r-1+i]?.[c-1+j]??'')),setValues:vals=>{vals.forEach((row,i)=>{rows[r-1+i]??=[];row.forEach((v,j)=>rows[r-1+i][c-1+j]=v);});},setNumberFormat:()=>{},setDataValidation:()=>{},copyTo:()=>{},createTextFinder:id=>({matchEntireCell:()=>({findNext:()=>{const idx=rows.findIndex(x=>x[0]===id);return idx<0?null:{getRow:()=>idx+1};}})})});
+ const sheet={getLastRow:()=>rows.length,getMaxRows:()=>1001,getRange:range};
+ const dv={requireValueInList:()=>dv,setAllowInvalid:()=>dv,build:()=>({})};
+ const context=vm.createContext({Date,JSON,Error,String,Number,Math,Array,Object,PropertiesService:{getScriptProperties:()=>({getProperty:k=>k==='INTEGRATION_SECRET'?secret:'sheet-id'})},ContentService:{MimeType:{JSON:'json'},createTextOutput:text=>({setMimeType:()=>text})},Utilities:{Charset:{UTF_8:'utf8'},computeHmacSha256Signature:(msg,key)=>[...createHmac('sha256',key).update(msg).digest()]},LockService:{getScriptLock:()=>({tryLock:()=>{locked=true;return true;},hasLock:()=>locked,releaseLock:()=>locked=false})},SpreadsheetApp:{openById:()=>({getSheetByName:()=>sheet}),flush:()=>{},newDataValidation:()=>dv,CopyPasteType:{PASTE_FORMAT:'format'}}});
+ vm.runInContext(await readFile(new URL('../google-apps-script/Validation.gs',import.meta.url),'utf8'),context);
+ vm.runInContext(await readFile(new URL('../google-apps-script/Receiver.gs',import.meta.url),'utf8'),context);
+ const payload=JSON.stringify(lead),timestamp=String(Date.now());const e={timestamp,payload,signature:createHmac('sha256',secret).update(timestamp+'.'+payload).digest('hex')};
+ const call=value=>JSON.parse(context.doPost({postData:{contents:JSON.stringify(value)}}));
+ assert.equal(call({...e,signature:'bad'}).ok,false);assert.equal(rows.length,1);
+ assert.equal(call(e).ok,true);assert.equal(rows.length,2);assert.equal(rows[1][19],'Teste');
+ rows[1][5]='Em contato';assert.equal(call(e).duplicate,true);assert.equal(rows.length,2);assert.equal(rows[1][5],'Em contato');assert.equal(locked,false);
+ const changed=JSON.stringify({...lead,email:'outro@example.com'});assert.equal(call({...e,payload:changed,signature:createHmac('sha256',secret).update(timestamp+'.'+changed).digest('hex')}).error,'id_conflict');
+});

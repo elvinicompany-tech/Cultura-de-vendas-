@@ -1,0 +1,8 @@
+{
+  "name": "CULTURA DE VENDAS",
+  "description": "Site institucional e comercial recuperado do Full Sales System com processos comerciais, depoimentos e formulário em etapas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
